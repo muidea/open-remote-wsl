@@ -1,137 +1,3 @@
-import * as crypto from 'crypto';
-import Log from './common/logger';
-import { getVSCodeServerConfig } from './serverConfig';
-import { WSLManager } from './wsl/wslManager';
-
-export interface ServerInstallOptions {
-    id: string;
-    quality: string;
-    commit: string;
-    version: string;
-    release?: string; // vscodium specific
-    extensionIds: string[];
-    envVariables: string[];
-    serverApplicationName: string;
-    serverDataFolderName: string;
-    serverDownloadUrlTemplate: string;
-}
-
-export interface ServerInstallResult {
-    exitCode: number;
-    listeningOn: number;
-    connectionToken: string;
-    logFile: string;
-    osReleaseId: string;
-    arch: string;
-    platform: string;
-    tmpDir: string;
-    [key: string]: any;
-}
-
-export class ServerInstallError extends Error {
-    constructor(message: string) {
-        super(message);
-    }
-}
-
-const DEFAULT_DOWNLOAD_URL_TEMPLATE = 'https://github.com/VSCodium/vscodium/releases/download/${version}.${release}/vscodium-reh-${os}-${arch}-${version}.${release}.tar.gz';
-
-export async function installCodeServer(wslManager: WSLManager, distroName: string, serverDownloadUrlTemplate: string | undefined, extensionIds: string[], envVariables: string[], logger: Log): Promise<ServerInstallResult> {
-    const scriptId = crypto.randomBytes(12).toString('hex');
-
-    const vscodeServerConfig = await getVSCodeServerConfig();
-    const installOptions: ServerInstallOptions = {
-        id: scriptId,
-        version: vscodeServerConfig.version,
-        commit: vscodeServerConfig.commit,
-        quality: vscodeServerConfig.quality,
-        release: vscodeServerConfig.release,
-        extensionIds,
-        envVariables,
-        serverApplicationName: vscodeServerConfig.serverApplicationName,
-        serverDataFolderName: vscodeServerConfig.serverDataFolderName,
-        serverDownloadUrlTemplate: serverDownloadUrlTemplate ?? vscodeServerConfig.serverDownloadUrlTemplate ?? DEFAULT_DOWNLOAD_URL_TEMPLATE,
-    };
-
-    const installServerScript = generateBashInstallScript(installOptions);
-
-    // Fish shell does not support heredoc so let's workaround it using -c option,
-    // also replace single quotes (') within the script with ('\'') as there's no quoting within single quotes, see https://unix.stackexchange.com/a/24676
-    const resp = await wslManager.exec('bash', ['-c', `'${installServerScript.replace(/'/g, `'\\''`)}'`], distroName);
-
-    const endScriptRegex = new RegExp(`${scriptId}: Server installation script done`, 'm');
-    const commandOutput = await Promise.race([
-        resp.exitPromise.then(result => ({ stdout: resp.stdout, stderr: resp.stderr, exitCode: result.exitCode })),
-        new Promise<{ stdout: string; stderr: string; exitCode: number }>((resolve) => {
-            resp.onStdoutData(buffer => {
-                if (endScriptRegex.test(buffer.toString('utf8'))) {
-                    resolve({ stdout: resp.stdout, stderr: resp.stderr, exitCode: 0 });
-                }
-            });
-        })
-    ]);
-
-    if (commandOutput.exitCode) {
-        logger.trace('Server install command stderr:', commandOutput.stderr);
-    }
-    logger.trace('Server install command stdout:', commandOutput.stdout);
-
-    const resultMap = parseServerInstallOutput(commandOutput.stdout, scriptId);
-    if (!resultMap) {
-        throw new ServerInstallError(`Failed parsing install script output`);
-    }
-
-    const exitCode = parseInt(resultMap.exitCode, 10);
-    if (exitCode !== 0) {
-        throw new ServerInstallError(`Couldn't install vscode server on remote server, install script returned non-zero exit status`);
-    }
-
-    const listeningOn = parseInt(resultMap.listeningOn, 10);
-
-    const remoteEnvVars = Object.fromEntries(Object.entries(resultMap).filter(([key,]) => envVariables.includes(key)));
-
-    return {
-        exitCode,
-        listeningOn,
-        connectionToken: resultMap.connectionToken,
-        logFile: resultMap.logFile,
-        osReleaseId: resultMap.osReleaseId,
-        arch: resultMap.arch,
-        platform: resultMap.platform,
-        tmpDir: resultMap.tmpDir,
-        ...remoteEnvVars
-    };
-}
-
-function parseServerInstallOutput(str: string, scriptId: string): { [k: string]: string } | undefined {
-    const startResultStr = `${scriptId}: start`;
-    const endResultStr = `${scriptId}: end`;
-
-    const startResultIdx = str.indexOf(startResultStr);
-    if (startResultIdx < 0) {
-        return undefined;
-    }
-
-    const endResultIdx = str.indexOf(endResultStr, startResultIdx + startResultStr.length);
-    if (endResultIdx < 0) {
-        return undefined;
-    }
-
-    const installResult = str.substring(startResultIdx + startResultStr.length, endResultIdx);
-
-    const resultMap: { [k: string]: string } = {};
-    const resultArr = installResult.split(/\r?\n/);
-    for (const line of resultArr) {
-        const [key, value] = line.split('==');
-        resultMap[key] = value;
-    }
-
-    return resultMap;
-}
-
-function generateBashInstallScript({ id, quality, version, commit, release, extensionIds, envVariables, serverApplicationName, serverDataFolderName, serverDownloadUrlTemplate }: ServerInstallOptions) {
-    const extensions = extensionIds.map(id => '--install-extension ' + id).join(' ');
-    return `
 #!/bin/bash
 # Server installation script
 
@@ -153,7 +19,7 @@ SERVER_INITIAL_EXTENSIONS="${extensions}"
 SERVER_LISTEN_FLAG="--port=0"
 SERVER_DATA_DIR="$HOME/${serverDataFolderName}"
 SERVER_DIR="$SERVER_DATA_DIR/bin/$DISTRO_COMMIT"
-SERVER_SCRIPT="$SERVER_DIR/bin/codium-server"
+SERVER_SCRIPT="$SERVER_DIR/bin/$SERVER_APP_NAME"
 SERVER_LOGFILE="$SERVER_DATA_DIR/bin/$DISTRO_COMMIT.log"
 SERVER_PIDFILE="$SERVER_DATA_DIR/bin/$DISTRO_COMMIT.pid"
 SERVER_TOKENFILE="$SERVER_DATA_DIR/bin/$DISTRO_COMMIT.token"
@@ -412,5 +278,3 @@ else
     log_debug "Server was already running, exiting with success"
     print_install_results_and_exit 0
 fi
-`;
-}
